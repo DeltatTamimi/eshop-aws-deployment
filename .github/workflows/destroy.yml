@@ -1,0 +1,75 @@
+name: Destroy AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm destruction of all resources'
+        required: true
+        default: ''
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  destroy:
+    name: Destroy Infrastructure
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm == 'destroy'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Create tfvars file
+        run: |
+          cat > terraform/terraform.tfvars << EOF
+          aws_region     = "eu-central-1"
+          environment    = "prod"
+          project_name   = "eshop"
+          vpc_cidr       = "10.0.0.0/16"
+          db_username    = "eshop_admin"
+          db_password    = "DummyPassword123!"
+          db_name        = "CatalogDb"
+          container_port = 8080
+          desired_count  = 2
+          EOF
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Destroy
+        working-directory: terraform
+        run: terraform destroy -auto-approve
+
+      - name: Destruction Summary
+        run: |
+          echo "=========================================="
+          echo "  All AWS resources have been destroyed!"
+          echo "=========================================="
+
+  rejected:
+    name: Destruction Cancelled
+    runs-on: ubuntu-latest
+    if: github.event.inputs.confirm != 'destroy'
+    steps:
+      - name: Cancelled
+        run: |
+          echo "=========================================="
+          echo "  Destruction cancelled."
+          echo "  You must type 'destroy' to confirm."
+          echo "=========================================="
+          exit 1
