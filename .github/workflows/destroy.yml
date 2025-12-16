@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type "destroy" to confirm destruction of all resources'
+        description: 'Type "destroy" to confirm'
         required: true
         default: ''
 
@@ -13,14 +13,11 @@ env:
 
 jobs:
   destroy:
-    name: Destroy Infrastructure
+    name: Destroy All Resources
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm == 'destroy'
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -28,40 +25,119 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: eu-central-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.6.0
-
-      - name: Create tfvars file
+      - name: Delete ECS Service
         run: |
-          cat > terraform/terraform.tfvars << EOF
-          aws_region     = "eu-central-1"
-          environment    = "prod"
-          project_name   = "eshop"
-          vpc_cidr       = "10.0.0.0/16"
-          db_username    = "eshop_admin"
-          db_password    = "DummyPassword123!"
-          db_name        = "CatalogDb"
-          container_port = 8080
-          desired_count  = 2
-          EOF
+          aws ecs update-service --cluster eshop-cluster --service eshop-service --desired-count 0 || true
+          sleep 5
+          aws ecs delete-service --cluster eshop-cluster --service eshop-service --force || true
 
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
+      - name: Delete ECS Cluster
+        run: aws ecs delete-cluster --cluster eshop-cluster || true
 
-      - name: Terraform Destroy
-        working-directory: terraform
-        run: terraform destroy -auto-approve
+      - name: Delete RDS Database
+        run: |
+          aws rds delete-db-instance \
+            --db-instance-identifier eshop-sqlserver \
+            --skip-final-snapshot \
+            --delete-automated-backups || true
 
-      - name: Destruction Summary
+      - name: Delete Load Balancer
+        run: |
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names eshop-alb --query "LoadBalancers[0].LoadBalancerArn" --output text 2>/dev/null || echo "")
+          if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+            aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN || true
+          fi
+
+      - name: Wait and Delete Target Group
+        run: |
+          sleep 30
+          TG_ARN=$(aws elbv2 describe-target-groups --names eshop-tg --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "")
+          if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
+            aws elbv2 delete-target-group --target-group-arn $TG_ARN || true
+          fi
+
+      - name: Delete ECR Repository
+        run: aws ecr delete-repository --repository-name eshop-web --force || true
+
+      - name: Delete NAT Gateway
+        run: |
+          NAT_ID=$(aws ec2 describe-nat-gateways --filter "Name=tag:Name,Values=eshop-nat-gw" "Name=state,Values=available,pending" --query "NatGateways[0].NatGatewayId" --output text 2>/dev/null || echo "")
+          if [ -n "$NAT_ID" ] && [ "$NAT_ID" != "None" ]; then
+            aws ec2 delete-nat-gateway --nat-gateway-id $NAT_ID || true
+            echo "Waiting 60 seconds for NAT Gateway to delete..."
+            sleep 60
+          fi
+
+      - name: Release Elastic IP
+        run: |
+          EIP_ALLOC=$(aws ec2 describe-addresses --filters "Name=tag:Name,Values=eshop-nat-eip" --query "Addresses[0].AllocationId" --output text 2>/dev/null || echo "")
+          if [ -n "$EIP_ALLOC" ] && [ "$EIP_ALLOC" != "None" ]; then
+            aws ec2 release-address --allocation-id $EIP_ALLOC || true
+          fi
+
+      - name: Wait for RDS Deletion
+        run: |
+          echo "Waiting for RDS to delete (up to 10 minutes)..."
+          for i in {1..20}; do
+            STATUS=$(aws rds describe-db-instances --db-instance-identifier eshop-sqlserver --query "DBInstances[0].DBInstanceStatus" --output text 2>/dev/null || echo "deleted")
+            if [ "$STATUS" = "deleted" ] || [ -z "$STATUS" ]; then
+              echo "RDS deleted"
+              break
+            fi
+            echo "RDS status: $STATUS - waiting..."
+            sleep 30
+          done
+
+      - name: Delete DB Subnet Group
+        run: aws rds delete-db-subnet-group --db-subnet-group-name eshop-db-subnet-group || true
+
+      - name: Delete VPC Resources
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=eshop-vpc" --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+          
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            # Delete Security Groups
+            for sg in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[?GroupName != 'default'].GroupId" --output text); do
+              aws ec2 delete-security-group --group-id $sg || true
+            done
+            
+            # Delete Subnets
+            for subnet in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output text); do
+              aws ec2 delete-subnet --subnet-id $subnet || true
+            done
+            
+            # Delete Route Tables
+            for rt in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --query "RouteTables[?Associations[0].Main != \`true\`].RouteTableId" --output text); do
+              aws ec2 delete-route-table --route-table-id $rt || true
+            done
+            
+            # Delete Internet Gateway
+            IGW=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --query "InternetGateways[0].InternetGatewayId" --output text)
+            if [ -n "$IGW" ] && [ "$IGW" != "None" ]; then
+              aws ec2 detach-internet-gateway --internet-gateway-id $IGW --vpc-id $VPC_ID || true
+              aws ec2 delete-internet-gateway --internet-gateway-id $IGW || true
+            fi
+            
+            # Delete VPC
+            aws ec2 delete-vpc --vpc-id $VPC_ID || true
+          fi
+
+      - name: Delete IAM Roles
+        run: |
+          aws iam detach-role-policy --role-name eshop-ecs-execution-role --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy || true
+          aws iam delete-role --role-name eshop-ecs-execution-role || true
+          aws iam delete-role --role-name eshop-ecs-task-role || true
+
+      - name: Delete CloudWatch Log Group
+        run: aws logs delete-log-group --log-group-name /ecs/eshop || true
+
+      - name: Destruction Complete
         run: |
           echo "=========================================="
-          echo "  All AWS resources have been destroyed!"
+          echo "All AWS resources have been destroyed!"
           echo "=========================================="
 
-  rejected:
+  cancelled:
     name: Destruction Cancelled
     runs-on: ubuntu-latest
     if: github.event.inputs.confirm != 'destroy'
@@ -69,7 +145,7 @@ jobs:
       - name: Cancelled
         run: |
           echo "=========================================="
-          echo "  Destruction cancelled."
-          echo "  You must type 'destroy' to confirm."
+          echo "Destruction cancelled."
+          echo "You must type 'destroy' to confirm."
           echo "=========================================="
           exit 1
